@@ -121,6 +121,9 @@
 #![feature(alloc_layout_extra)]
 #![feature(try_trait)]
 #![feature(associated_type_bounds)]
+#![feature(inplace_iteration)]
+#![feature(type_alias_impl_trait)]
+#![feature(never_type)]
 
 // Allow testing this library
 

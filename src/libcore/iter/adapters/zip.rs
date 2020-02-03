@@ -2,7 +2,10 @@
 
 use crate::cmp;
 
-use super::super::{DoubleEndedIterator, ExactSizeIterator, FusedIterator, Iterator, TrustedLen};
+use super::super::{
+    DoubleEndedIterator, ExactSizeIterator, FusedIterator, InPlaceIterable, Iterator, SourceIter,
+    TrustedLen,
+};
 
 /// An iterator that iterates two other iterators simultaneously.
 ///
@@ -259,6 +262,7 @@ where
 }
 
 #[doc(hidden)]
+#[unstable(issue = "none", feature = "std_internals")]
 unsafe impl<A, B> TrustedRandomAccess for Zip<A, B>
 where
     A: TrustedRandomAccess,
@@ -289,6 +293,31 @@ where
 {
 }
 
+// Arbitrarily selects the left side of the zip iteration as extractable "source"
+// it would require negative trait bounds to be able to try both
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S, A, B> SourceIter for Zip<A, B>
+where
+    A: SourceIter<Source = S>,
+    B: Iterator,
+    S: Iterator,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.a)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+// Limited to Item: Copy since interaction between Zip's use of TrustedRandomAccess
+// and Drop implementation of the source is unclear.
+//
+// An additional method returning the number of times the source has been logically advanced
+// (without calling next()) would be needed to properly drop the remainder of the source.
+unsafe impl<A: InPlaceIterable, B: Iterator> InPlaceIterable for Zip<A, B> where A::Item: Copy {}
+
 /// An iterator whose items are random-accessible efficiently
 ///
 /// # Safety
@@ -299,7 +328,10 @@ where
 /// .get_unchecked() must return distinct mutable references for distinct
 /// indices (if applicable), and must return a valid reference if index is in
 /// 0..self.len().
-pub(crate) unsafe trait TrustedRandomAccess: ExactSizeIterator {
+#[unstable(issue = "none", feature = "std_internals")]
+pub unsafe trait TrustedRandomAccess: ExactSizeIterator {
+    /// Returns item at offset `i` from the current position of the iterator.
+    /// It does not advance the iterator.
     unsafe fn get_unchecked(&mut self, i: usize) -> Self::Item;
     /// Returns `true` if getting an iterator element may have
     /// side effects. Remember to take inner iterators into account.

@@ -1,3 +1,4 @@
+// ignore-tidy-filelength
 use crate::cmp;
 use crate::fmt;
 use crate::intrinsics;
@@ -5,7 +6,9 @@ use crate::ops::{Add, AddAssign, Try};
 use crate::usize;
 
 use super::{from_fn, LoopState};
-use super::{DoubleEndedIterator, ExactSizeIterator, FusedIterator, Iterator, TrustedLen};
+use super::{
+    DoubleEndedIterator, ExactSizeIterator, FusedIterator, InPlaceIterable, Iterator, TrustedLen,
+};
 
 mod chain;
 mod flatten;
@@ -14,8 +17,76 @@ mod zip;
 pub use self::chain::Chain;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::flatten::{FlatMap, Flatten};
-pub(crate) use self::zip::TrustedRandomAccess;
+#[unstable(issue = "none", feature = "std_internals")]
+pub use self::zip::TrustedRandomAccess;
 pub use self::zip::Zip;
+
+/// This trait provides transitive access to source-stage in an interator-adapter pipeline
+/// under the conditions that
+/// * the iterator source `S` itself implements `SourceIter<Source = S>`
+/// * there is a delegating implementation of this trait for each adapter in the pipeline between
+///   the source and the pipeline consumer.
+///
+/// When the source is an owning iterator struct (commonly called `IntoIter`) then
+/// this can be useful for specializing [`FromIterator`] implementations or recovering the
+/// remaining elements after an iterator has been partially exhausted.
+///
+/// Note that implementations do not necessarily have to provide access to the inner-most
+/// source of a pipeline. A stateful intermediate adapter might eagerly evaluate a part
+/// of the pipeline and expose its internal storage as source.
+///
+/// The trait is unsafe because implementers must uphold additional safety properties.
+/// See [`as_inner`] for details.
+///
+/// # Examples
+///
+/// Retrieving a partially consumed source:
+///
+/// ```
+/// # #![feature(inplace_iteration)]
+/// # use std::iter::SourceIter;
+///
+/// let mut iter = vec![9, 9, 9].into_iter().map(|i| i * i);
+/// let _ = iter.next();
+/// let mut remainder = std::mem::replace(unsafe { iter.as_inner() }, Vec::new().into_iter());
+/// println!("n = {} elements remaining", remainder.len());
+/// ```
+///
+/// [`FromIterator`]: trait.FromIterator.html
+/// [`as_inner`]: #method.as_inner
+#[unstable(issue = "none", feature = "inplace_iteration")]
+pub unsafe trait SourceIter {
+    /// A source stage in an iterator pipeline.
+    type Source: Iterator;
+
+    /// Retrieve the source of an iterator pipeline.
+    ///
+    /// # Safety
+    ///
+    /// Implementations of must return the same mutable reference for their lifetime, unless
+    /// replaced by a caller.
+    /// Callers may only replace the reference when they stopped iteration and drop the
+    /// iterator pipeline after extracting the source.
+    ///
+    /// This means iterator adapters can rely on the source not changing during
+    /// iteration but they cannot rely on it in their Drop implementations.
+    ///
+    /// Implementing this method means adapters relinquish private-only access to their
+    /// source and can only rely on guarantees made based on method receiver types.
+    /// The lack of restricted access also requires that adapters must uphold the source's
+    /// public API even when they have access to its internals.
+    ///
+    /// Callers in turn must expect the source to be in any state that is consistent with
+    /// its public API since adapters sitting between it and the source have the same
+    /// access. In particular an adapter may have consumed more elements than strictly necessary.
+    ///
+    /// The overall goal of these requirements is to let the consumer of a pipeline use
+    /// * whatever remains in the source after iteration has stopped
+    /// * the memory that has become unused by advancing a consuming iterator
+    ///
+    /// [`next()`]: trait.Iterator.html#method.next
+    unsafe fn as_inner(&mut self) -> &mut Self::Source;
+}
 
 /// A double-ended iterator with the direction inverted.
 ///
@@ -253,6 +324,7 @@ where
 }
 
 #[doc(hidden)]
+#[unstable(issue = "none", feature = "std_internals")]
 unsafe impl<'a, I, T: 'a> TrustedRandomAccess for Copied<I>
 where
     I: TrustedRandomAccess<Item = &'a T>,
@@ -383,6 +455,7 @@ where
 }
 
 #[doc(hidden)]
+#[unstable(issue = "none", feature = "std_internals")]
 unsafe impl<'a, I, T: 'a> TrustedRandomAccess for Cloned<I>
 where
     I: TrustedRandomAccess<Item = &'a T>,
@@ -399,6 +472,7 @@ where
 }
 
 #[doc(hidden)]
+#[unstable(issue = "none", feature = "std_internals")]
 unsafe impl<'a, I, T: 'a> TrustedRandomAccess for Cloned<I>
 where
     I: TrustedRandomAccess<Item = &'a T>,
@@ -866,6 +940,7 @@ where
 }
 
 #[doc(hidden)]
+#[unstable(issue = "none", feature = "std_internals")]
 unsafe impl<B, I, F> TrustedRandomAccess for Map<I, F>
 where
     I: TrustedRandomAccess,
@@ -879,6 +954,23 @@ where
         true
     }
 }
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, B, I: Iterator, F> SourceIter for Map<I, F>
+where
+    F: FnMut(I::Item) -> B,
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<B, I: InPlaceIterable, F> InPlaceIterable for Map<I, F> where F: FnMut(I::Item) -> B {}
 
 /// An iterator that filters the elements of `iter` with `predicate`.
 ///
@@ -1011,6 +1103,23 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I: FusedIterator, P> FusedIterator for Filter<I, P> where P: FnMut(&I::Item) -> bool {}
 
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, P, I: Iterator> SourceIter for Filter<I, P>
+where
+    P: FnMut(&I::Item) -> bool,
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable, P> InPlaceIterable for Filter<I, P> where P: FnMut(&I::Item) -> bool {}
+
 /// An iterator that uses `f` to both filter and map elements from `iter`.
 ///
 /// This `struct` is created by the [`filter_map`] method on [`Iterator`]. See its
@@ -1136,6 +1245,26 @@ where
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl<B, I: FusedIterator, F> FusedIterator for FilterMap<I, F> where F: FnMut(I::Item) -> Option<B> {}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, B, I: Iterator, F> SourceIter for FilterMap<I, F>
+where
+    F: FnMut(I::Item) -> Option<B>,
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<B, I: InPlaceIterable, F> InPlaceIterable for FilterMap<I, F> where
+    F: FnMut(I::Item) -> Option<B>
+{
+}
 
 /// An iterator that yields the current count and the element during iteration.
 ///
@@ -1329,6 +1458,7 @@ where
 }
 
 #[doc(hidden)]
+#[unstable(issue = "none", feature = "std_internals")]
 unsafe impl<I> TrustedRandomAccess for Enumerate<I>
 where
     I: TrustedRandomAccess,
@@ -1347,6 +1477,22 @@ impl<I> FusedIterator for Enumerate<I> where I: FusedIterator {}
 
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<I> TrustedLen for Enumerate<I> where I: TrustedLen {}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, I: Iterator> SourceIter for Enumerate<I>
+where
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Enumerate<I> {}
 
 /// An iterator with a `peek()` that returns an optional reference to the next
 /// element.
@@ -1559,6 +1705,25 @@ impl<I: Iterator> Peekable<I> {
     }
 }
 
+#[unstable(feature = "trusted_len", issue = "37572")]
+unsafe impl<I> TrustedLen for Peekable<I> where I: TrustedLen {}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, I: Iterator> SourceIter for Peekable<I>
+where
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Peekable<I> {}
+
 /// An iterator that rejects elements while `predicate` returns `true`.
 ///
 /// This `struct` is created by the [`skip_while`] method on [`Iterator`]. See its
@@ -1657,6 +1822,26 @@ impl<I, P> FusedIterator for SkipWhile<I, P>
 where
     I: FusedIterator,
     P: FnMut(&I::Item) -> bool,
+{
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, P, I: Iterator> SourceIter for SkipWhile<I, P>
+where
+    P: FnMut(&I::Item) -> bool,
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for SkipWhile<I, F> where
+    F: FnMut(&I::Item) -> bool
 {
 }
 
@@ -1849,6 +2034,26 @@ where
 {
 }
 
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, P, I: Iterator> SourceIter for TakeWhile<I, P>
+where
+    P: FnMut(&I::Item) -> bool,
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for TakeWhile<I, F> where
+    F: FnMut(&I::Item) -> bool
+{
+}
+
 /// An iterator that skips over `n` elements of `iter`.
 ///
 /// This `struct` is created by the [`skip`] method on [`Iterator`]. See its
@@ -2030,6 +2235,22 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I> FusedIterator for Skip<I> where I: FusedIterator {}
 
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, I: Iterator> SourceIter for Skip<I>
+where
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Skip<I> {}
+
 /// An iterator that only iterates over the first `n` iterations of `iter`.
 ///
 /// This `struct` is created by the [`take`] method on [`Iterator`]. See its
@@ -2125,6 +2346,22 @@ where
         }
     }
 }
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, I: Iterator> SourceIter for Take<I>
+where
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Take<I> {}
 
 #[stable(feature = "double_ended_take_iterator", since = "1.38.0")]
 impl<I> DoubleEndedIterator for Take<I>
@@ -2256,6 +2493,26 @@ where
         let f = &mut self.f;
         self.iter.try_fold(init, scan(state, f, fold)).into_try()
     }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<St, F, B, S: Iterator, I: Iterator> SourceIter for Scan<I, St, F>
+where
+    I: SourceIter<Source = S>,
+    F: FnMut(&mut St, I::Item) -> Option<B>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<St, F, B, I: InPlaceIterable> InPlaceIterable for Scan<I, St, F> where
+    F: FnMut(&mut St, I::Item) -> Option<B>
+{
 }
 
 /// An iterator that yields `None` forever after the underlying iterator
@@ -2403,6 +2660,7 @@ where
     }
 }
 
+#[unstable(issue = "none", feature = "std_internals")]
 unsafe impl<I> TrustedRandomAccess for Fuse<I>
 where
     I: TrustedRandomAccess,
@@ -2512,6 +2770,22 @@ where
         self.iter.is_empty()
     }
 }
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, I: Iterator> SourceIter for Fuse<I>
+where
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Fuse<I> {}
 
 /// An iterator that calls a function with a reference to each element before
 /// yielding it.
@@ -2658,6 +2932,23 @@ where
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I: FusedIterator, F> FusedIterator for Inspect<I, F> where F: FnMut(&I::Item) {}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<S: Iterator, I: Iterator, F> SourceIter for Inspect<I, F>
+where
+    F: FnMut(&I::Item),
+    I: SourceIter<Source = S>,
+{
+    type Source = S;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut S {
+        SourceIter::as_inner(&mut self.iter)
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for Inspect<I, F> where F: FnMut(&I::Item) {}
 
 /// An iterator adapter that produces output as long as the underlying
 /// iterator produces `Result::Ok` values.
